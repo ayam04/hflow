@@ -35,14 +35,18 @@ rather than a consistency problem:
 import errno
 import fcntl
 import hashlib
+import logging
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Schemes obstore's from_url() accepts that name an object store we support.
 # file:// maps to a LocalStorageRoot instead (same semantics, no obstore);
@@ -552,8 +556,9 @@ class BucketStorageRoot:
 
         Freshness: one HEAD compares the remote etag against the sidecar
         recorded at download (or publish) time; only a changed or missing
-        object downloads. Raises ``FileNotFoundError`` (naming the full
-        remote location) when the object does not exist.
+        object downloads, and each download emits one DEBUG record saying
+        why it had to (an etag hit is silent). Raises ``FileNotFoundError``
+        (naming the full remote location) when the object does not exist.
         """
         key = _validated_relative_key(relative)
         local_file = self.mirror / key
@@ -572,6 +577,16 @@ class BucketStorageRoot:
                 and sidecar.read_text() == remote_etag
             ):
                 return local_file
+            if not local_file.is_file():
+                refresh_reason = "missing"
+            elif remote_etag is None:
+                refresh_reason = "no remote etag"
+            else:
+                refresh_reason = "stale"
+            # One DEBUG record per download, none for a cache hit: the hit is
+            # the quiet steady state, and the download is what explains a
+            # mirror that changes under a reader.
+            logger.debug("downloading %s into the mirror (%s)", key, refresh_reason)
             get_result = obstore.get(store, key)
             # The GET's own metadata etag (not the earlier HEAD's) goes into
             # the sidecar, so the recorded etag always matches the downloaded
@@ -613,11 +628,16 @@ class BucketStorageRoot:
         Existence is the only check: this is reserved for append-only,
         content-named trees (the catalog tables), where a file that exists
         locally is final by convention. Mutable files go through
-        :meth:`fetch` and its etag sidecar instead.
+        :meth:`fetch` and its etag sidecar instead. A call that transferred
+        anything emits one INFO summary (object count, bytes transferred,
+        elapsed time); a warm mirror is silent.
         """
         obstore = _load_obstore()
         store = self._get_store()
         self.workspace  # noqa: B018  -- ensures the mirror directory exists
+        downloaded = 0
+        transferred_bytes = 0
+        started = time.monotonic()
         for prefix in prefixes:
             for name in self.list_names(prefix):
                 local_file = self.mirror / name
@@ -626,7 +646,20 @@ class BucketStorageRoot:
                 # No lock or sidecar: immutable-file convention -- concurrent
                 # syncers can only write identical bytes, and the replace is
                 # atomic either way.
-                _download_to_file_atomically(obstore.get(store, name), local_file)
+                get_result = obstore.get(store, name)
+                transferred_bytes += get_result.meta["size"]
+                _download_to_file_atomically(get_result, local_file)
+                downloaded += 1
+        if downloaded:
+            # One record per call, not per object: a table sync is one
+            # decision ("this mirror was cold for these prefixes"), and a
+            # record per file would make a large catalog unreadable at INFO.
+            logger.info(
+                "synced %d object(s) (%d bytes) into the mirror in %.2fs",
+                downloaded,
+                transferred_bytes,
+                time.monotonic() - started,
+            )
         return self.mirror
 
     def _warm_mirror(self, local_file: Path, key: str, etag: str | None) -> None:
